@@ -67,7 +67,7 @@
   .figure { margin: 1.5em 0; }
   .figure figcaption { color: var(--muted); font-size: 0.9em; margin-top: 0.4em; }
   .scorer-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 1em; margin: 1em 0;
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1em; margin: 1em 0;
   }
   .scorer-card {
     border: 1px solid var(--rule); border-radius: 6px; padding: 1em;
@@ -80,6 +80,9 @@
   .small { font-size: 0.88em; color: var(--muted); }
   hr { border: 0; border-top: 1px solid var(--rule); margin: 2em 0; }
   .footnote { font-size: 0.85em; color: var(--muted); margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--rule); }
+  @media (max-width: 640px) {
+    .scorer-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 
@@ -92,24 +95,40 @@
 
 <div class="tldr">
   <h3>TL;DR</h3>
-  <p>On <code>Qwen3</code> base models, <strong>verifier choice alone can swing reported MATH-500 accuracy by ~20 percentage points along a single axis (symbolic equivalence) &mdash; and by up to ~80 pp end-to-end &mdash; without touching the model.</strong> We encountered this while building <strong>CRISP</strong>, an on-policy self-distillation method for compressing reasoning-model outputs, and we wanted to share what we found because it generalises beyond a single paper. The dominant axis of the gap, once an answer-extraction fallback is in place (which our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a> covered), is <strong>symbolic equivalence</strong>: responses such as <code>\dfrac{1}{2}</code> vs.&nbsp;<code>\frac{1}{2}</code>, <code>0.5</code> vs.&nbsp;<code>\frac{1}{2}</code>, or <code>2\sqrt{2}</code> vs.&nbsp;<code>\sqrt{8}</code> are all mathematically equivalent but fail under string-comparison scorers and succeed under <code>sympy</code>-based ones. We lay out a four-policy decomposition that pins down where each percentage point comes from.</p>
+  <p>On <code>Qwen3</code> base models, <strong>verifier choice alone can swing reported MATH-500 accuracy by ~80 percentage points end-to-end &mdash; without touching the model.</strong> The dominant axis, once a <code>\boxed{...}</code> answer-extraction fallback is in place (covered in our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a>), is <strong>symbolic equivalence</strong>: responses such as <code>\dfrac{1}{2}</code> vs.&nbsp;<code>\frac{1}{2}</code>, <code>0.5</code> vs.&nbsp;<code>\frac{1}{2}</code>, or <code>2\sqrt{2}</code> vs.&nbsp;<code>\sqrt{8}</code> are all mathematically equivalent but fail under string-comparison scorers and succeed under <code>sympy</code>-based ones &mdash; alone worth ~18 pp on Qwen3-8B base MATH-500. We walk through a three-policy decomposition (A&nbsp;&rarr;&nbsp;B&nbsp;&rarr;&nbsp;C) that pins down where each percentage point comes from. We noticed the gap while building <strong>CRISP</strong>, a reasoning-compression method; we discuss a CRISP-specific complication in the final section.</p>
 </div>
 
 <h2 id="background">1. Background: how we got to this question</h2>
 
-<p><strong>CRISP</strong> (<a href="https://arxiv.org/abs/2603.05433" target="_blank" rel="noopener">arXiv:2603.05433</a>) is a teacher&ndash;student framework for compressing reasoning-model outputs. The teacher is the base model conditioned on a concise system prompt, so the teacher's per-token distribution is shorter by construction; the student is trained via reverse-KL to match it, transferring that brevity to the unconditioned student. A typical <code>Qwen3-8B</code> response on MATH-500 drops from ~4,900 tokens at base to ~2,050 tokens at step-100 (a 59% reduction).</p>
-
-<p>While iterating on CRISP we cross-checked accuracy numbers under two scorer implementations: an internal extension of <code>math_dapo</code> (the scoring scripts that ship with the DAPO-Math training corpus), and HuggingFace <code>math_verify</code> (a <code>sympy</code>-backed reference implementation widely used in modern reasoning evaluations such as <code>lm-eval-harness</code> and <code>Open-R1</code>). On the same generated responses, the two scorers disagreed by ~20 percentage points on the <code>Qwen3-{8,14}B</code> MATH-500 baselines.</p>
+<p>While evaluating <code>Qwen3</code> base models on MATH-500 we cross-checked accuracy under two scorer implementations: an internal extension of <code>math_dapo</code> (the scoring scripts that ship with the DAPO-Math training corpus), and HuggingFace <code>math_verify</code> (a <code>sympy</code>-backed reference implementation widely used in modern reasoning evaluations such as <code>lm-eval-harness</code> and <code>Open-R1</code>). On the same generated responses, the two scorers disagreed by ~20 percentage points on the <code>Qwen3-{8,14}B</code> MATH-500 baselines.</p>
 
 <div class="callout warn">
   <p><strong>The puzzle.</strong> If both numbers come from the same generated MATH-500 responses, where do 20 percentage points come from?</p>
 </div>
 
-<p>The rest of this post walks through what we found, which turns out to be more interesting than &ldquo;the two libraries disagree.&rdquo; The gap decomposes cleanly into two distinct mechanisms (answer extraction and symbolic equivalence), and the second one &mdash; which we believe is under-discussed in the literature &mdash; dominates on Qwen3 outputs.</p>
+<p>The rest of this post walks through what we found, which turns out to be more interesting than &ldquo;the two libraries disagree.&rdquo; The gap decomposes cleanly into two distinct mechanisms (answer extraction and symbolic equivalence), and the second &mdash; which we believe is under-discussed in the literature &mdash; dominates on Qwen3 outputs.</p>
 
-<h2 id="four-scorers">2. The four scorer policies</h2>
+<p class="small">We originally hit this while iterating on <strong>CRISP</strong>, an on-policy self-distillation method for compressing reasoning-model outputs (<a href="https://arxiv.org/abs/2603.05433" target="_blank" rel="noopener">arXiv:2603.05433</a>). The base-model story stands on its own and is the focus of this post; a separate complication that arises only <em>after</em> training is in <a href="#crisp-wrinkle">&sect;7</a>.</p>
 
-<p>The same <code>(response, gold_answer)</code> pair can be turned into a score in dramatically different ways. We isolated four policies that span the design space encountered in current evaluation pipelines.</p>
+<h2 id="eval-setup">2. The eval setup, and an inherent format mismatch</h2>
+
+<p>To make the discussion concrete, every accuracy number in this post comes from sampling at <code>temperature=0.6</code>, <code>top_p=0.95</code>, <code>max_tokens=30000</code> (Qwen3 thinking-mode's recommended decoding settings), with this prompt template:</p>
+
+<pre><code>Solve the following math problem step by step. The last line
+of your response should be of the form Answer: $Answer (without
+quotes) where $Answer is the answer to the problem.
+
+{problem}</code></pre>
+
+<p>This is the prompt template that ships with the DAPO-Math corpus, and the explicit <code>Answer: $Answer</code> instruction is exactly what <code>math_dapo</code>'s extractor is built to expect.</p>
+
+<p>There is a tension that lives one layer underneath. <strong>Qwen3 thinking-mode was trained with <code>\boxed{...}</code> as the final-answer convention</strong> &mdash; the post-training data wires the model to emit <code>&lt;think&gt;...&lt;/think&gt;</code> followed by a polished solution ending in <code>\boxed{X}</code>. At eval time we ask it to follow a different instructional contract (<code>Answer: $Answer</code>). The base model's response to this conflict is to produce <em>both</em>: a polished solution with a <code>\boxed{X}</code> at the bottom, and sometimes a final <code>Answer: X</code> line. Often only the <code>\boxed{X}</code> survives &mdash; the model honours its training before it honours the prompt's last-line instruction.</p>
+
+<p>This eval-prompt-vs-training-format mismatch is the underlying reason the three scorer policies in the next section read such different numbers from the same generations. SCORER A trusts the eval prompt's contract; SCORER B and C add fallbacks that catch the model's trained habit.</p>
+
+<h2 id="three-scorers">3. Three scorer policies</h2>
+
+<p>The same <code>(response, gold_answer)</code> pair can be turned into a score in dramatically different ways. We isolate three policies that span the design space encountered in current base-model evaluation pipelines.</p>
 
 <div class="scorer-grid">
   <div class="scorer-card bad">
@@ -120,17 +139,12 @@
   <div class="scorer-card">
     <h4>SCORER B &mdash; <code>math_dapo</code> + <code>\boxed{}</code> fallback</h4>
     <p><strong>Extract:</strong> SCORER A regex; if no match, also try <code>\boxed{X}</code>. <strong>Compare:</strong> same string equality after normalization.</p>
-    <p class="small">The policy implicit in our prior pipeline. The 70&ndash;80% numbers in the earlier version of the paper come from this policy.</p>
-  </div>
-  <div class="scorer-card">
-    <h4>SCORER C &mdash; <code>math_verify</code> single-call</h4>
-    <p><strong>Extract:</strong> HuggingFace <code>math_verify</code>'s default extraction (<code>LatexExtractionConfig</code> for <code>\boxed{...}</code>, <code>ExprExtractionConfig</code> for anchored expressions). <strong>Compare:</strong> <code>sympy</code> symbolic equivalence.</p>
-    <p class="small">A single library call on the full response. Closest to what most modern reasoning-eval pipelines (<code>lm-eval</code>, <code>Open-R1</code>) use out of the box.</p>
+    <p class="small">A natural fix once you notice Qwen3 emits boxed answers. The 70&ndash;80% baselines commonly reported on Qwen3 MATH-500 use this policy.</p>
   </div>
   <div class="scorer-card good">
-    <h4>SCORER D &mdash; <code>math_verify</code> dual-path</h4>
-    <p><strong>Extract:</strong> SCORER C, plus a second pass that regex-extracts <code>Answer: X</code>, wraps as <code>\boxed{X}</code>, and runs <code>math_verify</code> on that constructed string. <strong>Compare:</strong> OR of both passes.</p>
-    <p class="small">Our final policy. Gives credit for both Qwen3's native <code>\boxed{}</code> format and the DAPO-prompt-requested <code>Answer: X</code> format.</p>
+    <h4>SCORER C &mdash; <code>math_verify</code></h4>
+    <p><strong>Extract:</strong> HuggingFace <code>math_verify</code>'s default extraction (<code>LatexExtractionConfig</code> for <code>\boxed{...}</code>, <code>ExprExtractionConfig</code> for anchored expressions). <strong>Compare:</strong> <code>sympy</code> symbolic equivalence.</p>
+    <p class="small">A single library call on the full response. Closest to what most modern reasoning-eval pipelines (<code>lm-eval</code>, <code>Open-R1</code>) use out of the box, and what we recommend as the default for base-model evaluation.</p>
   </div>
 </div>
 
@@ -141,63 +155,50 @@
   <li><strong>Comparison</strong> &mdash; once a substring is extracted, how is it compared to gold? String equality after canonicalisation, or symbolic equivalence via <code>sympy</code>?</li>
 </ol>
 
-<p>Our earlier post focused on the first axis (<a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">Answer Format Sensitivity in Qwen3 Math Reasoning Evaluation</a>); this post focuses on the second.</p>
+<p>Our earlier post focused on the first axis (<a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">Answer Format Sensitivity in Qwen3 Math Reasoning Evaluation</a>); this post focuses on the second. A subtle fourth policy, useful only after a model has been trained in a way that shifts its output format, is introduced in <a href="#crisp-wrinkle">&sect;7</a>.</p>
 
-<h2 id="empirics">3. The 12-cell table</h2>
+<h2 id="base-table">4. The base-model table</h2>
 
-<p>We re-scored the <em>same</em> per-sample generations (500 problems &times; 8 samples on MATH-500, 30 problems &times; 8 samples on each AIME year) for <code>Qwen3-{8,14}B</code>, both at base and at CRISP step-100, under all four policies.</p>
+<p>We re-scored the <em>same</em> per-sample generations (500 problems &times; 8 samples on MATH-500, 30 problems &times; 8 samples on each AIME year) for <code>Qwen3-{8,14}B</code> base under all three policies.</p>
 
 <table>
   <thead>
     <tr>
-      <th>Model</th><th>Benchmark</th><th>State</th>
-      <th class="num">A</th><th class="num">B</th><th class="num">C</th><th class="num">D</th>
+      <th>Model</th><th>Benchmark</th>
+      <th class="num">A</th><th class="num">B</th><th class="num">C</th>
     </tr>
   </thead>
   <tbody>
-    <tr><td rowspan="6"><code>Qwen3-8B</code></td>
-        <td>MATH-500</td><td>base</td>
-        <td class="num">18.55</td><td class="num">78.15</td><td class="num">96.35</td><td class="num bold">97.08</td></tr>
-    <tr><td>AIME 24</td><td>base</td>
-        <td class="num">5.00</td><td class="num">73.33</td><td class="num">75.83</td><td class="num bold">75.83</td></tr>
-    <tr><td>AIME 25</td><td>base</td>
-        <td class="num">2.92</td><td class="num">65.42</td><td class="num">66.67</td><td class="num bold">66.67</td></tr>
-    <tr><td>MATH-500</td><td>step-100</td>
-        <td class="num">84.97</td><td class="num">85.70</td><td class="num">93.00</td><td class="num bold">96.23</td></tr>
-    <tr><td>AIME 24</td><td>step-100</td>
-        <td class="num">62.50</td><td class="num">67.08</td><td class="num">70.42</td><td class="num bold">71.67</td></tr>
-    <tr><td>AIME 25</td><td>step-100</td>
-        <td class="num">46.67</td><td class="num">50.42</td><td class="num">53.33</td><td class="num bold">54.58</td></tr>
-    <tr><td rowspan="6"><code>Qwen3-14B</code></td>
-        <td>MATH-500</td><td>base</td>
-        <td class="num">35.05</td><td class="num">71.73</td><td class="num">94.53</td><td class="num bold">95.90</td></tr>
-    <tr><td>AIME 24</td><td>base</td>
-        <td class="num">2.08</td><td class="num">76.67</td><td class="num">80.00</td><td class="num bold">80.00</td></tr>
-    <tr><td>AIME 25</td><td>base</td>
-        <td class="num">2.92</td><td class="num">68.75</td><td class="num">70.42</td><td class="num bold">70.83</td></tr>
-    <tr><td>MATH-500</td><td>step-100</td>
-        <td class="num">84.17</td><td class="num">84.55</td><td class="num">91.00</td><td class="num bold">96.47</td></tr>
-    <tr><td>AIME 24</td><td>step-100</td>
-        <td class="num">62.08</td><td class="num">75.42</td><td class="num">75.83</td><td class="num bold">75.83</td></tr>
-    <tr><td>AIME 25</td><td>step-100</td>
-        <td class="num">45.83</td><td class="num">60.83</td><td class="num">63.75</td><td class="num bold">63.75</td></tr>
+    <tr><td rowspan="3"><code>Qwen3-8B</code></td>
+        <td>MATH-500</td>
+        <td class="num">18.55</td><td class="num">78.15</td><td class="num bold">96.35</td></tr>
+    <tr><td>AIME 24</td>
+        <td class="num">5.00</td><td class="num">73.33</td><td class="num bold">75.83</td></tr>
+    <tr><td>AIME 25</td>
+        <td class="num">2.92</td><td class="num">65.42</td><td class="num bold">66.67</td></tr>
+    <tr><td rowspan="3"><code>Qwen3-14B</code></td>
+        <td>MATH-500</td>
+        <td class="num">35.05</td><td class="num">71.73</td><td class="num bold">94.53</td></tr>
+    <tr><td>AIME 24</td>
+        <td class="num">2.08</td><td class="num">76.67</td><td class="num bold">80.00</td></tr>
+    <tr><td>AIME 25</td>
+        <td class="num">2.92</td><td class="num">68.75</td><td class="num bold">70.42</td></tr>
   </tbody>
 </table>
 
-<p class="small">Accuracy (%) under each scorer policy on identical generations. Bold = the strict-policy column we now recommend.</p>
+<p class="small">Accuracy (%) under each scorer policy on identical generations. Bold = the column we recommend as the default for base-model reporting.</p>
 
 <p>The table is information-dense; the most striking observations:</p>
 
 <ol>
-  <li><strong>Reading across, on the base rows:</strong> SCORER A reads 2&ndash;35% on the base model, while SCORER D reads 67&ndash;97%. Same generations.</li>
-  <li><strong>A &rarr; B (still string-equality, only adding the <code>\boxed{}</code> fallback)</strong> recovers most of the gap on MATH-500: +59.6 pp on 8B base, +36.7 pp on 14B base. This is the extraction story documented in our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a>.</li>
-  <li><strong>B &rarr; C (replacing string-equality with <code>sympy</code> symbolic equivalence)</strong> recovers another +18.2 pp on 8B-base MATH-500. <em>This is the gap that closes the 70&ndash;80% baseline up to 95&ndash;97%, and it is the focus of this post.</em></li>
-  <li><strong>The step-100 rows tell a different story.</strong> SCORER A jumps to 84&ndash;85%, SCORER B follows close behind, and SCORER C&rsquo;s lead narrows. CRISP&rsquo;s training shifts <em>which</em> scorer is binding (see Section 5).</li>
+  <li><strong>Reading across:</strong> SCORER A reads 2&ndash;35% on these base models, while SCORER C reads 67&ndash;96%. Same generations, same model, same problems &mdash; a swing of up to ~78 pp from scorer choice alone.</li>
+  <li><strong>A &rarr; B (still string-equality, only adding the <code>\boxed{}</code> fallback)</strong> recovers most of the gap on MATH-500: +59.6 pp on 8B, +36.7 pp on 14B. This is the extraction story documented in our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a>.</li>
+  <li><strong>B &rarr; C (replacing string-equality with <code>sympy</code> symbolic equivalence)</strong> recovers another +18.2 pp on 8B MATH-500 and +22.8 pp on 14B MATH-500. <em>This is the gap that closes the 70&ndash;80% baseline up to 95&ndash;97%, and it is the focus of this post.</em></li>
 </ol>
 
-<h2 id="prior-baseline">4. Decomposing the gap between scorer policies</h2>
+<h2 id="decomposition">5. Decomposing the gap</h2>
 
-<p>Our earlier verifier used SCORER B (<code>math_dapo</code>'s <code>Answer:</code> regex with a <code>\boxed{...}</code> fallback). The base-row SCORER B values (78.15 / 73.33 / 65.42 / 71.73 / 76.67 / 68.75) match the baselines from that verifier within 1&ndash;4 pp; SCORER A on the same generations reads 30&ndash;75 pp lower. Stepping across the four policies on a single cell pins down where each percentage point originates:</p>
+<p>Stepping across the three policies on a single cell pins down where each percentage point originates. Taking <code>Qwen3-8B</code> base MATH-500 as the running example:</p>
 
 <table>
   <thead>
@@ -206,12 +207,11 @@
   <tbody>
     <tr><td>A &rarr; B</td><td class="num">+59.60 pp</td><td>Add <code>\boxed{}</code> fallback to the extractor</td></tr>
     <tr><td>B &rarr; C</td><td class="num">+18.20 pp</td><td>Replace string-equality with <code>sympy</code> symbolic equivalence</td></tr>
-    <tr><td>C &rarr; D</td><td class="num">+0.73 pp</td><td>Add Answer-regex passthrough on top of <code>math_verify</code></td></tr>
   </tbody>
 </table>
 
 <figure class="figure">
-  <svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stacked bar showing the gap decomposition: SCORER A reads 18.55 percent. Adding boxed-extraction fallback adds 59.60 percentage points to reach SCORER B at 78.15 percent. Adding sympy symbolic equivalence adds 18.20 percentage points to reach SCORER C at 96.35 percent. Adding an Answer-regex dual-pass adds 0.73 percentage points to reach SCORER D at 97.08 percent.">
+  <svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stacked bar showing the gap decomposition: SCORER A reads 18.55 percent. Adding boxed-extraction fallback adds 59.60 percentage points to reach SCORER B at 78.15 percent. Adding sympy symbolic equivalence adds 18.20 percentage points to reach SCORER C at 96.35 percent.">
     <style>
       .lab    { font-family: -apple-system, sans-serif; font-size: 13px; fill: #1f2933; }
       .num    { font-family: "SF Mono", Menlo, monospace; font-size: 12px; font-weight: 700; }
@@ -223,24 +223,21 @@
       Gap decomposition &mdash; Qwen3-8B base, MATH-500 (4,000 samples)
     </text>
     <text x="360" y="40" text-anchor="middle" class="key">
-      How each scorer-policy change contributes to the 78.5 pp swing
+      How each scorer-policy change contributes to the 77.8 pp swing
     </text>
 
     <!-- Bar: x-origin=120, 1pp=5px, total width=500px → ends at x=620 -->
     <rect x="120" y="70" width="93"  height="58" fill="#9aa6b2"/>
     <rect x="213" y="70" width="298" height="58" fill="#d9a05a"/>
     <rect x="511" y="70" width="91"  height="58" fill="#5da777"/>
-    <rect x="602" y="70" width="4"   height="58" fill="#0b6fb4"/>
 
     <text x="166" y="105" text-anchor="middle" class="num" fill="#fff">18.55</text>
     <text x="362" y="105" text-anchor="middle" class="num" fill="#fff">+59.60</text>
     <text x="556" y="105" text-anchor="middle" class="num" fill="#fff">+18.20</text>
-    <text x="616" y="60"  text-anchor="middle" class="num" fill="#0b6fb4">+0.73</text>
-    <line x1="610" y1="64" x2="604" y2="72" stroke="#0b6fb4" stroke-width="1"/>
 
     <text x="213" y="60" text-anchor="middle" class="key">SCORER A = 18.55</text>
     <text x="511" y="60" text-anchor="middle" class="key">SCORER B = 78.15</text>
-    <text x="630" y="105" text-anchor="start"  class="num" fill="#0b6fb4">→ 97.08</text>
+    <text x="612" y="105" text-anchor="start"  class="num" fill="#0b6fb4">&rarr; 96.35</text>
 
     <line x1="120" y1="140" x2="620" y2="140" class="axis"/>
     <line x1="120" y1="140" x2="120" y2="146" class="axis"/>
@@ -265,15 +262,12 @@
 
       <rect x="320" y="0" width="12" height="12" fill="#5da777"/>
       <text x="338" y="10" class="key">B &rarr; C &mdash; <tspan font-family="SF Mono, monospace">sympy</tspan> symbolic equivalence (this post)</text>
-
-      <rect x="320" y="20" width="12" height="12" fill="#0b6fb4"/>
-      <text x="338" y="30" class="key">C &rarr; D &mdash; Answer-regex dual-pass</text>
     </g>
   </svg>
-  <figcaption>Figure 1. Each colored segment shows how much one scorer-policy change adds to the cumulative reading. The green segment (B&nbsp;&rarr;&nbsp;C) is the symbolic-equivalence contribution &mdash; the largest single gain after the extraction fallback is in place, and the main subject of this post.</figcaption>
+  <figcaption>Figure 1. Each coloured segment shows how much one scorer-policy change adds to the cumulative reading. The green segment (B&nbsp;&rarr;&nbsp;C) is the symbolic-equivalence contribution &mdash; the main subject of this post.</figcaption>
 </figure>
 
-<p>The two largest contributors are the <code>\boxed{}</code> extraction fallback (A&nbsp;&rarr;&nbsp;B, +59.60 pp) and the <code>sympy</code> symbolic-equivalence backend (B&nbsp;&rarr;&nbsp;C, +18.20 pp). The first arises because Qwen3 emits a boxed answer after <code>&lt;/think&gt;</code> and the <code>Answer:</code> regex misses it; this is the subject of our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a>. The second &mdash; the focus of this post &mdash; arises because once the answer is extracted, the model's surface form often differs from gold in ways that no fixed string-normalisation table can canonicalise.</p>
+<p>The two contributors are the <code>\boxed{}</code> extraction fallback (A&nbsp;&rarr;&nbsp;B, +59.60 pp) and the <code>sympy</code> symbolic-equivalence backend (B&nbsp;&rarr;&nbsp;C, +18.20 pp). The first arises because Qwen3 emits a boxed answer after <code>&lt;/think&gt;</code> and the <code>Answer:</code> regex misses it; this is the subject of our <a href="https://hjsang.github.io/qwen3-answer-format-sensitivity/" target="_blank" rel="noopener">earlier post</a>. The second &mdash; the focus of this post &mdash; arises because once the answer is extracted, the model's surface form often differs from gold in ways that no fixed string-normalisation table can canonicalise.</p>
 
 <h3 id="symbolic-failures">Concrete examples of B&rarr;C recoveries</h3>
 
@@ -292,15 +286,32 @@
   </tbody>
 </table>
 
-<p>Under SCORER B, each of these is treated as a wrong answer because the post-normalisation string differs from gold. Under SCORER C (or D), <code>math_verify</code>'s <code>sympy</code> backend recognises every one as the correct answer. None of the model behaviour changed; only the scorer's verdict did.</p>
+<p>Under SCORER B, each of these is treated as a wrong answer because the post-normalisation string differs from gold. Under SCORER C, <code>math_verify</code>'s <code>sympy</code> backend recognises every one as the correct answer. None of the model behaviour changed; only the scorer's verdict did.</p>
 
-<h2 id="formatting-shift">5. Training reshapes the model's output format, which then reshapes the scorer's verdict</h2>
+<h2 id="implications">6. Implications for evaluating reasoning models</h2>
 
-<p>Reading the table down the columns reveals a second, subtler effect: <strong>CRISP doesn't just change accuracy; it changes <em>format</em></strong>, and the change interacts with scorer choice.</p>
+<p>The headline is general. <strong>Verifier choice is a first-order methodological decision in reasoning-model evaluation, not a downstream detail.</strong> An ~80-pp accuracy gap on identical generated responses can hinge entirely on the scorer's extraction policy (<code>Answer:</code>-regex vs. <code>\boxed{...}</code> extraction vs. both) and on whether equivalence is checked by string match or symbolic computation. This is true on plain Qwen3 base models with no training pipeline involved.</p>
 
-<p>Reading down the 8B MATH-500 cell, SCORER B reads 78.15% at base and 85.70% at step-100 (+7.55 pp). SCORER C reads 96.35% &rarr; 93.00%, and SCORER D reads 97.08% &rarr; 96.23%. The trained model has changed something the three scorers respond to differently.</p>
+<p>Two specific recommendations for future reasoning-evaluation reports:</p>
 
-<p>The mechanism is direct. CRISP's teacher is the base model conditioned on a <em>concise</em> system prompt. When Qwen3 is asked to be concise, it strips LaTeX decoration before it strips content:</p>
+<ol>
+  <li><strong>Explicitly disclose the verifier.</strong> Prompt template, extraction policy, equivalence-checking backend, and library version. &ldquo;We used <code>math_verify</code>&rdquo; is ambiguous &mdash; default <code>ExtractionConfig</code> or custom? Single-call or dual-pass? A small implementation footnote eliminates ambiguity that can swing the headline by 20 pp.</li>
+  <li><strong>Apply the verifier identically to all rows of the comparison.</strong> A reported &ldquo;+X pp from training&rdquo; must use the same scorer policy on the baseline checkpoint and the trained checkpoint. Within-column comparisons (fixed scorer, varying training state) are the only ones invariant to the scorer-rebasing effect.</li>
+</ol>
+
+<p>Headline accuracy claims for reasoning models can otherwise reflect scorer rebasing rather than model behaviour &mdash; and, as the next section shows, the effect can grow when training itself reshapes the format of the model's output.</p>
+
+<h2 id="crisp-wrinkle">7. A wrinkle from CRISP: when training reshapes the output format</h2>
+
+<p>The three-policy taxonomy above is sufficient for evaluating base models. For models that have been trained in a way that changes their output format, a subtle gap opens between SCORER C and an extended dual-pass policy that we call SCORER D. We hit this while building CRISP and want to share the mechanism, because it can plausibly arise from any training method whose objective indirectly reshapes the model's output format.</p>
+
+<h3 id="what-is-crisp">What CRISP is</h3>
+
+<p><strong>CRISP</strong> (Compressed Reasoning via Iterative Self-Policy Distillation; <a href="https://arxiv.org/abs/2603.05433" target="_blank" rel="noopener">arXiv:2603.05433</a>) is a teacher&ndash;student framework for compressing reasoning-model outputs. The teacher is the base model conditioned on a concise system prompt; because the prompt nudges the model toward brevity, the teacher's per-token distribution is shorter by construction. The student is the same base model, unconditioned, trained via reverse-KL to match the teacher's distribution &mdash; transferring the teacher's brevity into the unconditioned student without needing ground-truth labels or a token-budget penalty. A typical <code>Qwen3-8B</code> response on MATH-500 drops from ~4,900 tokens at base to ~2,050 tokens at step-100 (a 59% reduction) at comparable accuracy.</p>
+
+<h3 id="format-shift">The format shift</h3>
+
+<p>CRISP's teacher is the base model under a <em>concise</em> system prompt. When Qwen3 is asked to be concise, it strips LaTeX decoration before it strips content:</p>
 
 <ul>
   <li>Drops the polished post-<code>&lt;/think&gt;</code> answer block (where <code>\dfrac</code>, <code>\left/\right</code>, <code>$...$</code> typically live).</li>
@@ -308,13 +319,38 @@
   <li>Strips inline math wrappers from numeric answers (<code>0.5</code> in place of <code>\dfrac{1}{2}</code>; <code>17</code> in place of <code>\boxed{17}</code>).</li>
 </ul>
 
-<p>The student inherits this style via reverse-KL. SCORER B's normalisation rule list then succeeds on payloads it previously failed on (a decorated <code>\dfrac{1}{2}</code> that didn't string-match gold <code>\frac{1}{2}</code> becomes the simpler <code>1/2</code>, which does match after normalisation). SCORER C and SCORER D, which use symbolic equivalence, are largely insensitive to the formatting shift.</p>
+<p>The student inherits this style via reverse-KL. Re-scoring the trained model under the same three policies shows the effect:</p>
 
-<p>This is a generic concern for any training method whose objective indirectly reshapes output format: cross-row comparisons under different scorers can read large gains or large regressions depending on which scorer the reader applies, even when the model's underlying correctness has not changed much. The conservative practice is to apply a single fixed policy to both rows of the comparison.</p>
+<table>
+  <thead>
+    <tr>
+      <th>Model</th><th>Benchmark</th><th>State</th>
+      <th class="num">A</th><th class="num">B</th><th class="num">C</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="2"><code>Qwen3-8B</code></td>
+        <td>MATH-500</td><td>base</td>
+        <td class="num">18.55</td><td class="num">78.15</td><td class="num">96.35</td></tr>
+    <tr><td>MATH-500</td><td>step-100</td>
+        <td class="num">84.97</td><td class="num">85.70</td><td class="num">93.00</td></tr>
+    <tr><td rowspan="2"><code>Qwen3-14B</code></td>
+        <td>MATH-500</td><td>base</td>
+        <td class="num">35.05</td><td class="num">71.73</td><td class="num">94.53</td></tr>
+    <tr><td>MATH-500</td><td>step-100</td>
+        <td class="num">84.17</td><td class="num">84.55</td><td class="num">91.00</td></tr>
+  </tbody>
+</table>
 
-<h3>The C &rarr; D gap on step-100 captures prompt-following recovery</h3>
+<p class="small">Accuracy (%) on MATH-500, base vs CRISP step-100, under the same three scorers as &sect;4.</p>
 
-<p>A second consequence of the format shift: step-100 responses frequently take the form <code>Answer: X</code> with <em>no</em> accompanying <code>\boxed{X}</code>. The trained model treats the <code>Answer:</code> line as its sole final commitment.</p>
+<p>SCORER A's normalisation rule list now succeeds on payloads it previously failed on (a decorated <code>\dfrac{1}{2}</code> that didn't string-match gold <code>\frac{1}{2}</code> becomes the simpler <code>1/2</code>, which does match after normalisation): A jumps from 18.55 to 84.97 on 8B, and B follows. SCORER C, by contrast, <em>drops</em> from 96.35 to 93.00. Same model behaviour at the level of correctness; different surface form; different scorer reading.</p>
+
+<p>This is a generic concern for any training method whose objective indirectly reshapes output format: cross-row comparisons under different scorers can read large gains or large regressions depending on which scorer the reader applies. The conservative practice (as already recommended in &sect;6) is to apply a single fixed policy to both rows.</p>
+
+<h3 id="scorer-d">SCORER D: a fourth policy for trained-model evaluation</h3>
+
+<p>The C-column drop on step-100 deserves a closer look. A material fraction of step-100 responses take the form <code>Answer: X</code> with <em>no</em> accompanying <code>\boxed{X}</code> &mdash; the trained model treats the <code>Answer:</code> line as its sole final commitment, exactly as the prompt instructed.</p>
 
 <p>SCORER C (single-call <code>math_verify</code>) cannot extract these unless <code>X</code> is a digit-led number or arithmetic expression &mdash; the only forms <code>ExprExtractionConfig</code>'s anchored regex (in <code>math_verify/parser.py</code>) matches:</p>
 
@@ -323,22 +359,17 @@ operators = ['+','-','*','/','^','(',')']
 expr_re   = r"-?\(?-?\d[\d\.\s+\-*/^()]*[+\-*/^()][\d\.\s+\-*/^()]+\)?"
 expr_or_number = (expr_re | number_re)</code></pre>
 
-<p>For MATH-500 text answers (<code>Evelyn</code>, <code>north</code>), multi-choice letters (<code>A</code>, <code>B</code>), and fraction or set expressions written without LaTeX delimiters, SCORER C returns 0 despite the model having followed the prompt's instructional contract verbatim. SCORER D recovers these &mdash; 129 / 4000 samples (+3.23 pp) on 8B-step-100 MATH-500, 219 / 4000 (+5.47 pp) on 14B-step-100 MATH-500 &mdash; by extracting the <code>Answer:</code> payload, wrapping as <code>\boxed{X}</code>, and reusing <code>math_verify</code>'s <code>LatexExtractionConfig</code> on the constructed string.</p>
+<p>For MATH-500 text answers (<code>Evelyn</code>, <code>north</code>), multi-choice letters (<code>A</code>, <code>B</code>), and fraction or set expressions written without LaTeX delimiters, SCORER C returns 0 despite the model having followed the prompt's instructional contract verbatim.</p>
 
-<p>The crucial point: this C &rarr; D recovery <em>only matters after training</em>. On base, the model writes <code>\boxed{X}</code> anyway, and the C and D columns agree to within a percentage point. After CRISP, the model drops the <code>\boxed{}</code> wrapping &mdash; and SCORER C, which still expects it, starts penalising responses that perfectly followed the prompt.</p>
+<p>The fix is a dual-pass extension on top of SCORER C:</p>
 
-<h2 id="implications">6. Implications for evaluating reasoning models</h2>
+<div class="scorer-card good" style="margin: 1em 0;">
+  <h4>SCORER D &mdash; <code>math_verify</code> dual-pass</h4>
+  <p><strong>Extract:</strong> SCORER C, plus a second pass that regex-extracts <code>Answer: X</code>, wraps as <code>\boxed{X}</code>, and runs <code>math_verify</code> on that constructed string. <strong>Compare:</strong> OR of both passes.</p>
+  <p class="small">Gives credit for both Qwen3's native <code>\boxed{}</code> format and the explicitly requested <code>Answer: X</code> format.</p>
+</div>
 
-<p>We came to this analysis while reconciling two scorers on a single project, but the result generalises. <strong>Verifier choice is a first-order methodological decision in reasoning-model evaluation, not a downstream detail.</strong> A 20-pp accuracy gap on identical generated responses can hinge entirely on the scorer's extraction policy (<code>Answer:</code>-regex vs. <code>\boxed{...}</code> extraction vs. both) and on whether equivalence is checked by string match or symbolic computation.</p>
-
-<p>Two specific recommendations for future reasoning-evaluation reports:</p>
-
-<ol>
-  <li><strong>Explicitly disclose the verifier.</strong> Prompt template, extraction policy, equivalence-checking backend, and library version. "We used <code>math_verify</code>" is ambiguous &mdash; single-call or dual-pass? Default <code>ExtractionConfig</code> or custom? A small implementation footnote eliminates ambiguity that can swing the headline by 20 pp.</li>
-  <li><strong>Apply the verifier identically to all rows of the comparison.</strong> A reported "+X pp from training" must use the same scorer policy on the baseline checkpoint and the trained checkpoint. Within-column comparisons (fixed scorer, varying training state) are the only ones invariant to formatting changes induced by training.</li>
-</ol>
-
-<p>Headline accuracy claims for reasoning-model training methods can otherwise reflect scorer rebasing rather than model improvement, particularly when training changes the model's output format &mdash; which, as we've seen, can happen as a side effect of objectives that are not nominally about formatting at all.</p>
+<p>Quantitatively, SCORER D recovers 129 / 4000 samples (+3.23 pp) on 8B step-100 MATH-500 and 219 / 4000 (+5.47 pp) on 14B step-100 MATH-500. On base, where the model still writes <code>\boxed{X}</code> almost everywhere, SCORER D adds at most +0.73 pp on top of SCORER C &mdash; which is why we omit it from the main taxonomy in &sect;3. SCORER D is the policy we use in CRISP's in-training validation and rollout filter; it is reasonable to consider for any reasoning-model evaluation where training has shifted the model toward bare-text answers.</p>
 
 <hr>
 
