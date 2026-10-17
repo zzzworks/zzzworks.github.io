@@ -2,21 +2,21 @@
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
     <title>1 | Zhengze Zhou (周正泽)</title>
-    <link>https://ZhengzeZhou.github.io/publication-type/1/</link>
-      <atom:link href="https://ZhengzeZhou.github.io/publication-type/1/index.xml" rel="self" type="application/rss+xml" />
+    <link>https://zzzworks.github.io/publication-type/1/</link>
+      <atom:link href="https://zzzworks.github.io/publication-type/1/index.xml" rel="self" type="application/rss+xml" />
     <description>1</description>
     <generator>Wowchemy (https://wowchemy.com)</generator><language>en-us</language><lastBuildDate>Fri, 01 Jan 2021 00:00:00 +0000</lastBuildDate>
     <image>
-      <url>https://ZhengzeZhou.github.io/media/icon_hu0b7a4cb9992c9ac0e91bd28ffd38dd00_9727_512x512_fill_lanczos_center_2.png</url>
+      <url>https://zzzworks.github.io/media/icon_hu0b7a4cb9992c9ac0e91bd28ffd38dd00_9727_512x512_fill_lanczos_center_2.png</url>
       <title>1</title>
-      <link>https://ZhengzeZhou.github.io/publication-type/1/</link>
+      <link>https://zzzworks.github.io/publication-type/1/</link>
     </image>
     
     <item>
       <title>S-LIME: Stabilized-LIME for Model Explanation</title>
-      <link>https://ZhengzeZhou.github.io/publication/zhou-2021-s/</link>
+      <link>https://zzzworks.github.io/publication/zhou-2021-s/</link>
       <pubDate>Fri, 01 Jan 2021 00:00:00 +0000</pubDate>
-      <guid>https://ZhengzeZhou.github.io/publication/zhou-2021-s/</guid>
+      <guid>https://zzzworks.github.io/publication/zhou-2021-s/</guid>
       <description></description>
     </item>
     
